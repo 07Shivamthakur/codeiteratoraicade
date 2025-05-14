@@ -1,17 +1,19 @@
 import streamlit as st
 import subprocess
 from pydantic import BaseModel, Field
-from mistralai import Mistral
+
 import anthropic
 import instructor
-from instructor import from_mistral
+
 from pathlib import Path
 import re
 from difflib import SequenceMatcher
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, Depends, HTTPException, Security
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security.api_key import APIKeyHeader
 import uvicorn
 from typing import Optional
+import os
 # ========== Search/Replace-Block Approach with Improved Matching ==========
 class SearchReplaceResponse(BaseModel):
     """Schema for the LLM response."""
@@ -23,48 +25,35 @@ class AssetLinkRequest(BaseModel):
     input_code_file: str = Field(description="The source code to modify.")
     user_prompt: str = Field(description="The user's prompt describing the desired changes.")
     asset_url: Optional[str] = Field(None, description="Optional URL to an asset to include in the code.")
+
 class PlanResponse(BaseModel):
     """Schema for the LLM-generated plan."""
     plan: str = Field(description="The structured plan describing all changes to be made.")
-def generate_task_plan(prompt: str, source_code: str) -> str:
+
+def extract_asset_url_from_prompt(prompt: str) -> Optional[str]:
     """
-    Uses a language model to produce a structured plan of all the changes required
-    to fully address the user's request.
+    Extract asset URL from a prompt using various regex patterns.
+    Returns the first matching URL or None if no URL is found.
     """
-    api_key = ""
-    mistral_client = Mistral(api_key=api_key)
-    planning_client = from_mistral(
-        client=mistral_client,
-        model="mistral-large-latest",
-        max_tokens=3096,
-    )
-    planning_prompt = f"""
-    The user wants the following changes:
-    "{prompt}"
-    Given the source code:
-    ```js
-    {source_code}
-    ```
-    Ensure this format is followed for all blocks
-    <<<<<<< SEARCH
-     original lines
-    =======
-     updated lines
-    >>>>>>> REPLACE
-    Your task:
-    1. Break this into specific, actionable steps for `preload`, `create`, `update`, and any new methods.
-    2. Mention the number of SEARCH/REPLACE blocks expected for each lifecycle method.
-    3. Describe each step clearly.
-    """
-    response = planning_client.messages.create(
-        response_model=PlanResponse,
-        messages=[
-            {"role": "system", "content": "You are a code planning expert."},
-            {"role": "user", "content": planning_prompt},
-        ],
-    )
-    plan = response.plan.strip()
-    return plan
+    # Enhanced patterns for asset URLs in prompts
+    url_patterns = [
+        r'asset (?:url|link)[\s:]+([^\s,]+)',
+        r'(?:image|icon|resource) (?:url|link)[\s:]+([^\s,]+)',
+        r'(?:use|include|add) (?:the )?(?:asset|image|icon|resource)[\s:]+([^\s,]+)',
+        r'(?:https?://[^\s,]+\.(?:png|jpg|jpeg|gif|svg|webp|mp3|mp4|wav|ogg))',
+        r'(?:use|include|add|with) (?:this|the) (?:url|link)[\s:]+([^\s,]+)',
+        r'(?:url|link)[\s:]+([^\s,]+\.(?:png|jpg|jpeg|gif|svg|webp|mp3|mp4|wav|ogg))'
+    ]
+
+    for pattern in url_patterns:
+        matches = re.findall(pattern, prompt, re.IGNORECASE)
+        if matches:
+            extracted_url = matches[0]
+            print(f"Extracted asset URL from prompt: {extracted_url}")
+            return extracted_url
+
+    return None
+
 def generate_search_replace_blocks(plan: str, source_code: str, asset_url: Optional[str] = None) -> tuple:
     """
     Generate SEARCH/REPLACE blocks based on the task plan, source code, and optional asset URL.
@@ -72,26 +61,14 @@ def generate_search_replace_blocks(plan: str, source_code: str, asset_url: Optio
     """
     # Check if there's an asset URL in the prompt if none was explicitly provided
     if not asset_url:
-        # Common patterns for asset URLs in prompts
-        url_patterns = [
-            r'asset (?:url|link)[\s:]+([^\s,]+)',
-            r'(?:image|icon|resource) (?:url|link)[\s:]+([^\s,]+)',
-            r'(?:use|include|add) (?:the )?(?:asset|image|icon|resource)[\s:]+([^\s,]+)',
-            r'(?:https?://[^\s,]+\.(?:png|jpg|jpeg|gif|svg|webp|mp3|mp4|wav|ogg))'
-        ]
-
-        for pattern in url_patterns:
-            matches = re.findall(pattern, plan, re.IGNORECASE)
-            if matches:
-                asset_url = matches[0]
-                print(f"Extracted asset URL from prompt: {asset_url}")
-                break
+        asset_url = extract_asset_url_from_prompt(plan)
 
     asset_instruction = ""
     if asset_url:
         asset_instruction = f"""
         IMPORTANT: Include the following asset URL in your implementation: {asset_url}
         Make sure to properly integrate this asset into the code according to the user's request.
+        The asset URL should be used appropriately based on its file type (image, audio, etc.).
         """
 
     modification_prompt = f"""
@@ -111,26 +88,31 @@ def generate_search_replace_blocks(plan: str, source_code: str, asset_url: Optio
     You can delete code by replacing it with newline and showing the code which needs to be worked on
     Output SEARCH/REPLACE blocks for each task. Ensure all changes are made comprehensively and provide explanations.
     """
-    instructor_client = instructor.from_anthropic(
-        anthropic.Anthropic(api_key=""),
-    )
-    response = instructor_client.chat.completions.create(
-        model="claude-3-5-sonnet-latest",
-        response_model=SearchReplaceResponse,
-        max_tokens=8192,
-        messages=[
-            {"role": "system", "content": "You are an expert js code modifier.'Please do ensure that Scope and Context Issue: function is defined outside the class'  doesnt happen"},
-            {"role": "system", "content": """Ensure this format is followed for all blocks
-    <<<<<<< SEARCH
-     original lines
-    =======
-     updated lines
-    >>>>>>> REPLACE"""},
-            {"role": "user", "content": modification_prompt},
-        ],
-    )
-    print(response.search_replace)
-    return response.search_replace, response.explanation
+
+    try:
+        instructor_client = instructor.from_anthropic(
+            anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", "")),
+        )
+        response = instructor_client.chat.completions.create(
+            model="claude-3-5-sonnet-latest",
+            response_model=SearchReplaceResponse,
+            max_tokens=8192,
+            messages=[
+                {"role": "system", "content": "You are an expert js code modifier.'Please do ensure that Scope and Context Issue: function is defined outside the class'  doesnt happen"},
+                {"role": "system", "content": """Ensure this format is followed for all blocks
+        <<<<<<< SEARCH
+         original lines
+        =======
+         updated lines
+        >>>>>>> REPLACE"""},
+                {"role": "user", "content": modification_prompt},
+            ],
+        )
+        print(response.search_replace)
+        return response.search_replace, response.explanation
+    except Exception as e:
+        print(f"Error generating code modifications: {str(e)}")
+        raise e
 def parse_search_replace_blocks(content: str):
     """
     Parse the AI's response for SEARCH/REPLACE blocks of the form:
@@ -240,9 +222,11 @@ def validate_final_code_with_esprima(code: str) -> bool:
 def main():
     st.title("js Code Modification Tool")
     st.write("Provide a prompt and source code. The AI will produce SEARCH/REPLACE blocks to modify your Phaser.js code.")
+
     prompt = st.text_area("Enter your modification prompt:", "")
     source_code = st.text_area("Enter the source code:", "")
     asset_url = st.text_input("Asset URL (optional):", "")
+    st.info("You can also include asset URLs directly in your prompt.")
 
     if st.button("Generate Code Changes"):
         if not prompt or not source_code:
@@ -253,20 +237,9 @@ def main():
                     # Check if there's an asset URL in the prompt if none was explicitly provided
                     extracted_asset_url = asset_url
                     if not extracted_asset_url:
-                        # Common patterns for asset URLs in prompts
-                        url_patterns = [
-                            r'asset (?:url|link)[\s:]+([^\s,]+)',
-                            r'(?:image|icon|resource) (?:url|link)[\s:]+([^\s,]+)',
-                            r'(?:use|include|add) (?:the )?(?:asset|image|icon|resource)[\s:]+([^\s,]+)',
-                            r'(?:https?://[^\s,]+\.(?:png|jpg|jpeg|gif|svg|webp|mp3|mp4|wav|ogg))'
-                        ]
-
-                        for pattern in url_patterns:
-                            matches = re.findall(pattern, prompt, re.IGNORECASE)
-                            if matches:
-                                extracted_asset_url = matches[0]
-                                st.info(f"Extracted asset URL from prompt: {extracted_asset_url}")
-                                break
+                        extracted_asset_url = extract_asset_url_from_prompt(prompt)
+                        if extracted_asset_url:
+                            st.info(f"Extracted asset URL from prompt: {extracted_asset_url}")
 
                     search_replace_blocks, exp = generate_search_replace_blocks(prompt, source_code, extracted_asset_url)
                     st.subheader("Generated SEARCH/REPLACE Blocks")
@@ -288,8 +261,27 @@ def main():
                 except Exception as e:
                     st.error(f"Error generating code changes: {e}")
 
+# API Key configuration
+API_KEY = os.environ.get("API_KEY", "test-api-key")  # Default key for testing
+API_KEY_NAME = "x-api-key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+async def get_api_key(api_key_header: str = Security(api_key_header)):
+    if api_key_header == API_KEY:
+        return api_key_header
+    raise HTTPException(
+        status_code=401,
+        detail="Invalid API Key",
+    )
+
 # Create FastAPI app
-app = FastAPI()
+app = FastAPI(
+    title="Aicade Code Modification API",
+    description="API for modifying JavaScript code with asset link integration",
+    version="1.0.0",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+)
 
 # Add CORS middleware
 app.add_middleware(
@@ -300,8 +292,10 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
+
+
 @app.post("/generate-code/")
-async def generate_code(request: AssetLinkRequest):
+async def generate_code(request: AssetLinkRequest, _: str = Depends(get_api_key)):
     """
     API endpoint to generate code changes with optional asset link integration.
 
@@ -321,20 +315,9 @@ async def generate_code(request: AssetLinkRequest):
         # First, check if there's an asset URL in the prompt if none was explicitly provided
         asset_url = request.asset_url
         if not asset_url:
-            # Common patterns for asset URLs in prompts
-            url_patterns = [
-                r'asset (?:url|link)[\s:]+([^\s,]+)',
-                r'(?:image|icon|resource) (?:url|link)[\s:]+([^\s,]+)',
-                r'(?:use|include|add) (?:the )?(?:asset|image|icon|resource)[\s:]+([^\s,]+)',
-                r'(?:https?://[^\s,]+\.(?:png|jpg|jpeg|gif|svg|webp|mp3|mp4|wav|ogg))'
-            ]
-
-            for pattern in url_patterns:
-                matches = re.findall(pattern, request.user_prompt, re.IGNORECASE)
-                if matches:
-                    asset_url = matches[0]
-                    print(f"API: Extracted asset URL from prompt: {asset_url}")
-                    break
+            asset_url = extract_asset_url_from_prompt(request.user_prompt)
+            if asset_url:
+                print(f"API: Extracted asset URL from prompt: {asset_url}")
 
         search_replace, explanation = generate_search_replace_blocks(
             request.user_prompt,
@@ -360,7 +343,8 @@ async def generate_code(request: AssetLinkRequest):
             "detected_asset_url": asset_url
         }
     except Exception as e:
-        return {"error": str(e)}
+        error_message = f"Error code: {getattr(e, 'status_code', 500)} - {str(e)}"
+        return {"error": error_message}
 
 # Run the app with both Streamlit and FastAPI
 if __name__ == "__main__":
