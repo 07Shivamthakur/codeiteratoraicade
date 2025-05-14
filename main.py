@@ -112,7 +112,7 @@ def generate_search_replace_blocks(plan: str, source_code: str, asset_url: Optio
     Output SEARCH/REPLACE blocks for each task. Ensure all changes are made comprehensively and provide explanations.
     """
     instructor_client = instructor.from_anthropic(
-        anthropic.Anthropic(api_key="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"),
+        anthropic.Anthropic(api_key=""),
     )
     response = instructor_client.chat.completions.create(
         model="claude-3-5-sonnet-latest",
