@@ -1,6 +1,7 @@
 import streamlit as st
 import subprocess
 from pydantic import BaseModel, Field
+import difflib  # Added for diff visualization
 
 import anthropic
 import instructor
@@ -12,8 +13,9 @@ from fastapi import FastAPI, Body, Depends, HTTPException, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 import uvicorn
-from typing import Optional
+from typing import Optional, List, Tuple, Dict
 import os
+
 # ========== Search/Replace-Block Approach with Improved Matching ==========
 class SearchReplaceResponse(BaseModel):
     """Schema for the LLM response."""
@@ -91,7 +93,7 @@ def generate_search_replace_blocks(plan: str, source_code: str, asset_url: Optio
 
     try:
         instructor_client = instructor.from_anthropic(
-            anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", "")),
+            anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY",  "")),
         )
         response = instructor_client.chat.completions.create(
             model="claude-3-5-sonnet-latest",
@@ -113,6 +115,7 @@ def generate_search_replace_blocks(plan: str, source_code: str, asset_url: Optio
     except Exception as e:
         print(f"Error generating code modifications: {str(e)}")
         raise e
+
 def parse_search_replace_blocks(content: str):
     """
     Parse the AI's response for SEARCH/REPLACE blocks of the form:
@@ -154,36 +157,192 @@ def parse_search_replace_blocks(content: str):
             blocks.append((original_text, updated_text))
         i += 1
     return blocks
-def apply_search_replace_blocks(source_code: str, blocks):
+
+# ========== OPTIMIZED SEARCH/REPLACE FUNCTIONS ==========
+def fuzzy_match(source: str, pattern: str, threshold: float = 0.85) -> Tuple[bool, float, str]:
     """
-    Apply each SEARCH/REPLACE block to the source code in memory.
+    Find similar code blocks using fuzzy matching.
+    Returns (found, similarity_score, matched_snippet)
     """
-    updated_code = source_code
-    for original_text, updated_text in blocks:
-        if original_text in updated_code:
-            updated_code = updated_code.replace(original_text, updated_text)
-        else:
-            print(f"Warning: Failed to apply block. Original text not found:\n{original_text}")
-    return updated_code
+    lines = source.split('\n')
+    pattern_lines = pattern.strip().split('\n')
+    pattern_text = pattern.strip()
+    
+    best_match = None
+    best_similarity = 0.0
+    
+    # Check for exact match first
+    if pattern in source:
+        return True, 1.0, pattern
+    
+    # Try matching line-by-line with context
+    for i in range(len(lines) - len(pattern_lines) + 1):
+        window = '\n'.join(lines[i:i+len(pattern_lines)])
+        similarity = SequenceMatcher(None, window, pattern_text).ratio()
+        
+        if similarity > best_similarity:
+            best_similarity = similarity
+            best_match = window
+            
+    if best_similarity >= threshold:
+        return True, best_similarity, best_match
+        
+    return False, best_similarity, ""
+
+def contextual_match(source: str, pattern: str, context_lines: int = 2) -> Tuple[bool, str]:
+    """
+    Match code using surrounding context.
+    Returns (found, matched_snippet)
+    """
+    pattern_text = pattern.strip()
+    source_lines = source.split('\n')
+    
+    # Try matching with surrounding context
+    for i in range(len(source_lines)):
+        start = max(0, i - context_lines)
+        end = min(len(source_lines), i + context_lines + 1)
+        context_block = '\n'.join(source_lines[start:end])
+        
+        if pattern_text in context_block:
+            return True, context_block
+            
+    return False, ""
+
+def apply_blocks_safely(source: str, blocks: List[Tuple[str, str]]) -> Tuple[str, List[Dict]]:
+    """
+    Apply blocks with intelligent fallbacks and detailed reporting.
+    Returns (updated_code, application_report)
+    """
+    updated = source
+    report = []
+    applied_count = 0
+    
+    for i, (search, replace) in enumerate(blocks):
+        block_report = {
+            "block_number": i+1,
+            "search": search,
+            "replace": replace,
+            "status": "not_applied",
+            "method": "",
+            "similarity": 0.0,
+            "notes": ""
+        }
+        
+        # Track original state
+        before = updated
+        
+        # 1. Try exact match
+        if search in updated:
+            updated = updated.replace(search, replace, 1)
+            block_report["status"] = "applied"
+            block_report["method"] = "exact_match"
+            applied_count += 1
+            report.append(block_report)
+            continue
+            
+        # 2. Try normalized match (ignore whitespace)
+        norm_search = re.sub(r'\s+', ' ', search).strip()
+        norm_updated = re.sub(r'\s+', ' ', updated).strip()
+        if norm_search in norm_updated:
+            # Find original position using normalized match
+            start_idx = norm_updated.find(norm_search)
+            end_idx = start_idx + len(norm_search)
+            
+            # Map back to original text
+            orig_start = 0
+            norm_pos = 0
+            for char in updated:
+                if norm_pos == start_idx:
+                    break
+                if re.match(r'\s', char):
+                    norm_pos += 1 if char == ' ' else 0
+                else:
+                    norm_pos += 1
+                orig_start += 1
+                
+            orig_end = orig_start
+            while norm_pos < end_idx and orig_end < len(updated):
+                char = updated[orig_end]
+                if re.match(r'\s', char):
+                    norm_pos += 1 if char == ' ' else 0
+                else:
+                    norm_pos += 1
+                orig_end += 1
+                
+            orig_snippet = updated[orig_start:orig_end]
+            updated = updated[:orig_start] + replace + updated[orig_end:]
+            block_report["status"] = "applied"
+            block_report["method"] = "normalized_match"
+            applied_count += 1
+            report.append(block_report)
+            continue
+            
+        # 3. Try fuzzy match
+        found, similarity, matched_snippet = fuzzy_match(updated, search)
+        if found:
+            updated = updated.replace(matched_snippet, replace, 1)
+            block_report["status"] = "applied"
+            block_report["method"] = f"fuzzy_match ({similarity:.2f})"
+            block_report["similarity"] = similarity
+            applied_count += 1
+            report.append(block_report)
+            continue
+            
+        # 4. Try contextual match
+        found, context_block = contextual_match(updated, search)
+        if found:
+            # Simple replacement in context block (for demo)
+            updated = updated.replace(context_block, context_block.replace(search, replace), 1)
+            block_report["status"] = "applied"
+            block_report["method"] = "contextual_match"
+            applied_count += 1
+            report.append(block_report)
+            continue
+            
+        # 5. Final fallback: Couldn't apply
+        block_report["status"] = "failed"
+        block_report["method"] = "no_match_found"
+        block_report["notes"] = "Original pattern not found in source code"
+        report.append(block_report)
+    
+    return updated, report
+
+def generate_diff_report(source: str, updated: str) -> str:
+    """Generate visual diff output"""
+    diff = difflib.unified_diff(
+        source.splitlines(), 
+        updated.splitlines(),
+        fromfile='Original',
+        tofile='Updated',
+        lineterm=''
+    )
+    return '\n'.join(diff)
+
+def apply_search_replace_blocks(source_code: str, blocks) -> Tuple[str, List[Dict]]:
+    """
+    Apply each SEARCH/REPLACE block to the source code with optimizations.
+    Returns (updated_code, application_report)
+    """
+    return apply_blocks_safely(source_code, blocks)
+
 def debug_applied_changes(source_code: str, blocks):
     """
     Debugging function to log changes step-by-step.
     """
     print("Initial Source Code:")
     print(source_code)
-    updated_code = source_code
-    for i, (original_text, updated_text) in enumerate(blocks, start=1):
-        print(f"\n--- Applying Block {i} ---")
-        print(f"SEARCH:\n{original_text}")
-        print(f"REPLACE:\n{updated_text}")
-        if original_text in updated_code:
-            updated_code = updated_code.replace(original_text, updated_text)
-            print("Block applied successfully.")
-        else:
-            print("Warning: Original text not found. Block skipped.")
+    updated_code, report = apply_search_replace_blocks(source_code, blocks)
+    
+    print("\nApplication Report:")
+    for entry in report:
+        print(f"Block {entry['block_number']}: {entry['status']} ({entry['method']})")
+        if entry['status'] == 'failed':
+            print(f"  Search pattern: {entry['search']}")
+    
     print("\nFinal Updated Code:")
     print(updated_code)
     return updated_code
+
 def format_code_with_prettier(code: str) -> str:
     """
     Format JavaScript code using Prettier.
@@ -201,6 +360,7 @@ def format_code_with_prettier(code: str) -> str:
         return process.stdout
     except FileNotFoundError:
         raise RuntimeError("Prettier is not installed or not found in PATH.")
+
 def validate_final_code_with_esprima(code: str) -> bool:
     """
     Validate JavaScript code syntax using esprima.
@@ -219,12 +379,13 @@ def validate_final_code_with_esprima(code: str) -> bool:
         return True
     except FileNotFoundError:
         raise RuntimeError("Esprima is not installed or not found in PATH.")
+
 def main():
     st.title("js Code Modification Tool")
     st.write("Provide a prompt and source code. The AI will produce SEARCH/REPLACE blocks to modify your Phaser.js code.")
 
     prompt = st.text_area("Enter your modification prompt:", "")
-    source_code = st.text_area("Enter the source code:", "")
+    source_code = st.text_area("Enter the source code:", "", height=300)
     asset_url = st.text_input("Asset URL (optional):", "")
     st.info("You can also include asset URLs directly in your prompt.")
 
@@ -244,11 +405,31 @@ def main():
                     search_replace_blocks, exp = generate_search_replace_blocks(prompt, source_code, extracted_asset_url)
                     st.subheader("Generated SEARCH/REPLACE Blocks")
                     st.code(search_replace_blocks, language="js")
-                    st.code(exp)
+                    st.subheader("Explanation")
+                    st.write(exp)
+                    
                     try:
                         parsed_blocks = parse_search_replace_blocks(search_replace_blocks)
-                        debug_applied_changes(source_code, parsed_blocks)  # Debugging added
-                        updated_code = apply_search_replace_blocks(source_code, parsed_blocks)
+                        updated_code, report = apply_search_replace_blocks(source_code, parsed_blocks)
+                        
+                        # Show application report
+                        st.subheader("Block Application Report")
+                        applied_count = sum(1 for entry in report if entry['status'] == 'applied')
+                        total_blocks = len(report)
+                        st.write(f"Applied {applied_count} of {total_blocks} blocks:")
+                        
+                        for entry in report:
+                            status_emoji = "✅" if entry['status'] == 'applied' else "❌"
+                            st.write(f"{status_emoji} Block {entry['block_number']}: {entry['method']}")
+                            if entry['status'] != 'applied':
+                                with st.expander(f"View failed block {entry['block_number']}"):
+                                    st.code(entry['search'], language='js')
+                        
+                        # Show diff preview
+                        st.subheader("Changes Preview")
+                        diff_report = generate_diff_report(source_code, updated_code)
+                        st.code(diff_report, language='diff')
+                        
                         if validate_final_code_with_esprima(updated_code):
                             formatted_code = format_code_with_prettier(updated_code)
                             st.success("All tasks applied and syntax validated successfully!")
@@ -292,8 +473,6 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-
-
 @app.post("/generate-code/")
 async def generate_code(request: AssetLinkRequest, _: str = Depends(get_api_key)):
     """
@@ -310,6 +489,7 @@ async def generate_code(request: AssetLinkRequest, _: str = Depends(get_api_key)
     - explanation: Explanation of the changes made to the code
     - updated_code: The final updated code after applying the changes
     - detected_asset_url: The asset URL that was used (either from asset_url parameter or extracted from prompt)
+    - application_report: Detailed report of how blocks were applied
     """
     try:
         # First, check if there's an asset URL in the prompt if none was explicitly provided
@@ -326,7 +506,7 @@ async def generate_code(request: AssetLinkRequest, _: str = Depends(get_api_key)
         )
 
         parsed_blocks = parse_search_replace_blocks(search_replace)
-        updated_code = apply_search_replace_blocks(request.input_code_file, parsed_blocks)
+        updated_code, application_report = apply_search_replace_blocks(request.input_code_file, parsed_blocks)
 
         # Try to format the code if possible
         try:
@@ -340,7 +520,8 @@ async def generate_code(request: AssetLinkRequest, _: str = Depends(get_api_key)
             "search_replace": search_replace,
             "explanation": explanation,
             "updated_code": updated_code,
-            "detected_asset_url": asset_url
+            "detected_asset_url": asset_url,
+            "application_report": application_report
         }
     except Exception as e:
         error_message = f"Error code: {getattr(e, 'status_code', 500)} - {str(e)}"
